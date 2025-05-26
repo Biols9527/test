@@ -1095,11 +1095,28 @@ def map_protein_alignment_to_dna(original_dna_file, protein_alignment_file, outp
         with open(output_dna_alignment_file, 'w') as out:
             for seq_id, seq in aligned_dna.items():
                 out.write(f">{seq_id}\n{seq}\n")
-        
-        logger.info(f"成功将蛋白质比对映射回DNA: {len(aligned_dna)} 条序列")
+            # Try to force write to disk
+            try:
+                out.flush()
+                os.fsync(out.fileno())
+            except Exception as e:
+                logger.warning(f"Error during flush/fsync for {output_dna_alignment_file}: {e}")
+
+       # Verification after closing the file
+        if not os.path.exists(output_dna_alignment_file) or os.path.getsize(output_dna_alignment_file) == 0:
+            logger.error(f"Output file {output_dna_alignment_file} was not created or is empty after map_protein_alignment_to_dna.")
+            # Try to remove potentially empty/corrupt file
+            if os.path.exists(output_dna_alignment_file):
+                try:
+                    os.remove(output_dna_alignment_file)
+                except Exception as e_rem:
+                    logger.warning(f"Could not remove problematic file {output_dna_alignment_file}: {e_rem}")
+            return False
+
+        logger.info(f"成功将蛋白质比对映射回DNA: {len(aligned_dna)} 条序列, written to {output_dna_alignment_file}")
         return True
     except Exception as e:
-        logger.error(f"映射蛋白质比对到DNA时出错: {str(e)}")
+        logger.error(f"映射蛋白质比对到DNA时出错 for {output_dna_alignment_file}: {str(e)}")
         logger.error(traceback.format_exc())
         return False
 
@@ -2636,24 +2653,55 @@ def process_cds_file_with_alignment_quality(file_path, output_dir, aligner_param
         else:
             success, output_path = run_aligner(initial_fasta, initial_output, aligner_params)
         
-        if not success:
-            logger.error(f"初始比对 {file_name} 失败")
-            # 退回到最长序列策略
-            logger.info(f"退回到使用最长序列策略")
+        # Fallback logic helper function
+        def _fallback_to_standard_processing(reason):
+            logger.error(reason)
             simplified_seqs = {}
-            for species, id_to_seq in species_to_seqs.items():
-                best_id = max(id_to_seq.items(), key=lambda x: len(x[1]))[0]
-                simplified_seqs[species] = id_to_seq[best_id]
-                logger.info(f"为物种 {species} 选择了最长序列 {best_id}")
+            for sp_name, id_map in species_to_seqs.items():
+                if not id_map:
+                    logger.warning(f"No sequences found for species {sp_name} during fallback for {gene_name} ({reason}).")
+                    continue
+                longest_seq_val = ""
+                chosen_id = None
+                for seq_id_key, sequence_val_val in id_map.items():
+                    if len(sequence_val_val) > len(longest_seq_val):
+                        longest_seq_val = sequence_val_val
+                        chosen_id = seq_id_key
+                if longest_seq_val: # Ensure a sequence was actually found
+                    simplified_seqs[sp_name] = longest_seq_val
+                    # Log which sequence was chosen for the species if needed for debugging
+                    # logger.debug(f"Fallback for {sp_name} in {gene_name}: chose {chosen_id} (length {len(longest_seq_val)})")
+            logger.info(f"Falling back to standard processing with 'longest sequence' strategy for {gene_name} due to: {reason}")
             return process_cds_file_standard(file_path, output_dir, aligner_params, simplified_seqs)
+
+        if not success:
+            return _fallback_to_standard_processing(f"Initial alignment for {gene_name} (all duplicates) failed using {aligner_params['aligner']}.")
+
+        # **** NEW VERIFICATION STEP for the output_path from run_aligner ****
+        if not output_path or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+             return _fallback_to_standard_processing(f"Initial alignment output file {output_path} for {gene_name} is missing or empty after aligner run.")
+        # **** END NEW VERIFICATION STEP ****
         
         # 如果需要，修复比对框架
+        # Before calling advanced_fix_alignment_frame, ensure output_path exists
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            return _fallback_to_standard_processing(f"Cannot fix frame for {gene_name}, alignment file {output_path} is missing or empty before frame fixing attempt.")
+
         valid, frame_info = check_alignment_validity(output_path)
-        if not valid or 'codon' in frame_info and '不保持' in frame_info:
-            logger.warning(f"需要修复比对框架: {frame_info}")
-            fixed_output = os.path.join(temp_dir, f"{gene_name}_initial_fixed.best.fas")
-            advanced_fix_alignment_frame(output_path, fixed_output)
-            output_path = fixed_output
+        fixed_alignment_path_initial = os.path.join(temp_dir, f"{gene_name}_initial_fixed.best.fas") # Define clearly
+
+        if not valid or (isinstance(frame_info, str) and ('codon' in frame_info and ('不保持' in frame_info or '不是3的倍数' in frame_info))):
+            logger.warning(f"需要修复比对框架 for {gene_name} based on initial check: {frame_info}. Original aligner output: {output_path}")
+            if advanced_fix_alignment_frame(output_path, fixed_alignment_path_initial):
+                # Verify the fixed file
+                if not os.path.exists(fixed_alignment_path_initial) or os.path.getsize(fixed_alignment_path_initial) == 0:
+                    return _fallback_to_standard_processing(f"Frame fixing for {gene_name} produced a missing or empty file: {fixed_alignment_path_initial}.")
+                output_path = fixed_alignment_path_initial
+                logger.info(f"Alignment frame fixed for {gene_name}, new path: {output_path}")
+            else:
+                # If advanced_fix_alignment_frame returns False, it means fixing failed or was not needed but file might still be problematic.
+                # Rely on the next check_alignment_validity or specific error messages from advanced_fix_alignment_frame.
+                logger.warning(f"Frame fixing attempt for {gene_name} did not result in a new file or failed; proceeding with {output_path}.")
         
         # 步骤4: 基于比对质量为每个物种选择最佳序列
         best_sequences = select_best_duplicate_sequences(species_to_seqs, output_path)
