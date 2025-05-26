@@ -1357,7 +1357,7 @@ def safe_translate_codon(codon):
     logger.warning(f"未知的密码子: '{codon}'")
     return 'X'
 
-def run_mafft(input_file, output_file, mafft_path, codon_aware=False):
+def run_mafft(input_file, output_file, mafft_path, codon_aware=False, aligner_params=None):
     """
     运行MAFFT进行序列比对，改进密码子感知处理
     性能优化：调整MAFFT参数以优化性能
@@ -1367,8 +1367,14 @@ def run_mafft(input_file, output_file, mafft_path, codon_aware=False):
         output_file: 输出文件路径
         mafft_path: MAFFT可执行文件路径
         codon_aware: 是否保持密码子结构
+        aligner_params: Dictionary containing aligner parameters including 'aligner_threads' and 'clean_temp'
     """
     start_time = time.time()
+
+    if aligner_params is None:
+        aligner_params = {}
+    aligner_threads = aligner_params.get('aligner_threads', 1)
+    clean_temp_flag = aligner_params.get('clean_temp', True)
     
     # 确保mafft_path存在且可执行
     if not os.path.exists(mafft_path):
@@ -1383,28 +1389,30 @@ def run_mafft(input_file, output_file, mafft_path, codon_aware=False):
     if codon_aware:
         logger.info("使用密码子感知方式运行MAFFT")
         temp_dir = os.path.dirname(output_file)
-        
-        # 1. 将序列转换为氨基酸
         protein_input = os.path.join(temp_dir, os.path.basename(input_file).replace('.fasta', '.prot.fasta'))
-        dna_to_protein_for_alignment(input_file, protein_input)
-        
-        # 2. 比对蛋白质 - 性能优化：使用快速算法
         protein_output = os.path.join(temp_dir, os.path.basename(output_file).replace('.fasta', '.prot.aln'))
         
-        # 检查序列数量，为大数据集使用快速算法
-        seq_count = sum(1 for _ in SeqIO.parse(protein_input, "fasta"))
-        
-        if seq_count > 200:
-            # 使用FFT-NS-2算法处理大型数据集
-            logger.info(f"检测到大型数据集（{seq_count}个序列），使用FFT-NS-2算法")
-            protein_cmd = [mafft_path, '--quiet', '--retree', '2', '--maxiterate', '0', protein_input]
-        else:
-            # 使用较精确的算法处理小型数据集
-            protein_cmd = [mafft_path, '--quiet', '--localpair', '--maxiterate', '1000', protein_input]
-        
-        logger.debug(f"运行蛋白质对齐: {' '.join(protein_cmd)}")
-        
         try:
+            # 1. 将序列转换为氨基酸
+            dna_to_protein_for_alignment(input_file, protein_input)
+            
+            # 2. 比对蛋白质 - 性能优化：使用快速算法
+            seq_count = sum(1 for _ in SeqIO.parse(protein_input, "fasta"))
+            
+            protein_cmd = [mafft_path, '--quiet']
+            if seq_count > 200: 
+                logger.info(f"检测到大型数据集（{seq_count}个序列），使用FFT-NS-2算法")
+                protein_cmd.extend(['--retree', '2', '--maxiterate', '0'])
+            else: 
+                logger.info(f"使用较精确的算法处理小型数据集 ({seq_count}个序列)")
+                protein_cmd.extend(['--localpair', '--maxiterate', '1000'])
+            
+            if aligner_threads > 0:
+                 protein_cmd.extend(['--thread', str(aligner_threads)])
+            protein_cmd.append(protein_input)
+            
+            logger.debug(f"运行蛋白质对齐: {' '.join(protein_cmd)}")
+            
             with open(protein_output, 'w') as outfile:
                 protein_result = subprocess.run(protein_cmd, stdout=outfile, stderr=subprocess.PIPE, text=True)
                 
@@ -1419,10 +1427,15 @@ def run_mafft(input_file, output_file, mafft_path, codon_aware=False):
                 return True, output_file
             else:
                 return False, "无法将蛋白质对齐映射回DNA"
-        except Exception as e:
-            logger.error(f"运行MAFFT蛋白质对齐时出错: {str(e)}")
-            logger.error(traceback.format_exc())
-            return False, str(e)
+        finally:
+            if clean_temp_flag:
+                for f_to_clean in [protein_input, protein_output]:
+                    if os.path.exists(f_to_clean):
+                        try:
+                            os.remove(f_to_clean)
+                            logger.debug(f"Cleaned up temporary protein file: {f_to_clean}")
+                        except OSError as e:
+                            logger.warning(f"Error cleaning up temporary protein file {f_to_clean}: {e}")
     else:
         # 普通MAFFT运行，带有适用于DNA的通用参数
         cmd = [mafft_path]
@@ -1437,6 +1450,9 @@ def run_mafft(input_file, output_file, mafft_path, codon_aware=False):
         else:
             # 小型数据集：使用较精确的算法
             cmd.append('--auto')
+        
+        if aligner_threads > 0: 
+            cmd.extend(['--thread', str(aligner_threads)])
             
         cmd.extend(['--quiet', input_file])  # 重定向输出
         
@@ -1464,7 +1480,7 @@ def run_mafft(input_file, output_file, mafft_path, codon_aware=False):
             logger.error(f"运行 MAFFT 时发生异常: {str(e)}")
             logger.error(traceback.format_exc())
             return False, str(e)
-def run_muscle(input_file, output_file, muscle_path, codon_aware=False):
+def run_muscle(input_file, output_file, muscle_path, codon_aware=False, aligner_params=None):
     """
     运行MUSCLE进行序列比对，改进密码子感知处理
     性能优化：调整MUSCLE参数
@@ -1474,9 +1490,15 @@ def run_muscle(input_file, output_file, muscle_path, codon_aware=False):
         output_file: 输出文件路径
         muscle_path: MUSCLE可执行文件路径
         codon_aware: 是否保持密码子结构
+        aligner_params: Dictionary containing aligner parameters including 'aligner_threads' and 'clean_temp'
     """
     start_time = time.time()
-    
+
+    if aligner_params is None:
+        aligner_params = {}
+    aligner_threads = aligner_params.get('aligner_threads', 1)
+    clean_temp_flag = aligner_params.get('clean_temp', True)
+
     # 确保muscle_path存在且可执行
     if not os.path.exists(muscle_path):
         logger.error(f"MUSCLE 可执行文件未在此路径找到: {muscle_path}")
@@ -1486,53 +1508,62 @@ def run_muscle(input_file, output_file, muscle_path, codon_aware=False):
         logger.error(f"MUSCLE 可执行文件没有执行权限: {muscle_path}")
         return False, "可执行文件没有执行权限"
     
+    muscle_version = get_muscle_version(muscle_path)
+    
     # 如果请求密码子感知比对，使用蛋白质引导方法
     if codon_aware:
         logger.info("使用密码子感知方式运行MUSCLE")
         temp_dir = os.path.dirname(output_file)
-        
-        # 1. 将序列转换为氨基酸
         protein_input = os.path.join(temp_dir, os.path.basename(input_file).replace('.fasta', '.prot.fasta'))
-        dna_to_protein_for_alignment(input_file, protein_input)
-        
-        # 2. 比对蛋白质
         protein_output = os.path.join(temp_dir, os.path.basename(output_file).replace('.fasta', '.prot.aln'))
-        
-        # 检查MUSCLE版本并设置参数
-        muscle_version = get_muscle_version(muscle_path)
-        
-        if muscle_version >= 5:
-            # MUSCLE v5+使用新的参数集
-            protein_cmd = [muscle_path, '-align', protein_input, '-output', protein_output]
-            logger.debug(f"检测到MUSCLE v5+，使用新参数格式")
-        else:
-            # MUSCLE v3/v4使用传统参数
-            protein_cmd = [muscle_path, '-in', protein_input, '-out', protein_output]
-        
-        logger.debug(f"运行蛋白质对齐: {' '.join(protein_cmd)}")
-        protein_result = subprocess.run(protein_cmd, capture_output=True, text=True)
-        
-        if protein_result.returncode != 0:
-            logger.error(f"MUSCLE蛋白质对齐错误: {protein_result.stderr}")
-            return False, "蛋白质对齐失败"
+
+        try:
+            # 1. 将序列转换为氨基酸
+            dna_to_protein_for_alignment(input_file, protein_input)
             
-        # 3. 将蛋白质比对映射回DNA
-        success = map_protein_alignment_to_dna(input_file, protein_output, output_file)
-        if success:
-            logger.info(f"成功完成基于蛋白质引导的密码子感知对齐，输出至 {output_file}")
-            return True, output_file
-        else:
-            return False, "无法将蛋白质对齐映射回DNA"
+            # 2. 比对蛋白质
+            protein_cmd = []
+            if muscle_version >= 5:
+                protein_cmd = [muscle_path, '-align', protein_input, '-output', protein_output]
+                if aligner_threads > 0:
+                    protein_cmd.extend(['-threads', str(aligner_threads)])
+                logger.debug(f"检测到MUSCLE v5+，使用新参数格式")
+            else:
+                protein_cmd = [muscle_path, '-in', protein_input, '-out', protein_output]
+            
+            logger.debug(f"运行蛋白质对齐: {' '.join(protein_cmd)}")
+            protein_result = subprocess.run(protein_cmd, capture_output=True, text=True)
+            
+            if protein_result.returncode != 0:
+                logger.error(f"MUSCLE蛋白质对齐错误: {protein_result.stderr}")
+                return False, "蛋白质对齐失败"
+                
+            # 3. 将蛋白质比对映射回DNA
+            success = map_protein_alignment_to_dna(input_file, protein_output, output_file)
+            if success:
+                logger.info(f"成功完成基于蛋白质引导的密码子感知对齐，输出至 {output_file}")
+                return True, output_file
+            else:
+                return False, "无法将蛋白质对齐映射回DNA"
+        finally:
+            if clean_temp_flag:
+                for f_to_clean in [protein_input, protein_output]:
+                    if os.path.exists(f_to_clean):
+                        try:
+                            os.remove(f_to_clean)
+                            logger.debug(f"Cleaned up temporary protein file: {f_to_clean}")
+                        except OSError as e:
+                            logger.warning(f"Error cleaning up temporary protein file {f_to_clean}: {e}")
     else:
         # 普通MUSCLE运行，自动检测版本和调整参数
-        muscle_version = get_muscle_version(muscle_path)
-        
+        cmd = []
         if muscle_version >= 5:
-            # MUSCLE v5+
             cmd = [muscle_path, '-align', input_file, '-output', output_file]
+            if aligner_threads > 0:
+                cmd.extend(['-threads', str(aligner_threads)])
         else:
-            # MUSCLE v3/v4
             cmd = [muscle_path, '-in', input_file, '-out', output_file]
+            # Older MUSCLE versions typically don't support threading via command line
             
         logger.info(f"运行 MUSCLE: {' '.join(cmd)}")
         
@@ -1592,7 +1623,7 @@ def get_muscle_version(muscle_path):
         return 3  # 默认假设是v3
 
 def run_prank(input_file, output_prefix, prank_path, codon_aware=True, f=0.2, 
-             gaprate=None, gapext=None, use_logs=False, penalize_terminal_gaps=False):
+             gaprate=None, gapext=None, use_logs=False, penalize_terminal_gaps=False, aligner_params=None):
     """
     运行PRANK进行多序列比对，带有优化参数
     性能优化：添加线程和内存优化参数
@@ -1607,8 +1638,12 @@ def run_prank(input_file, output_prefix, prank_path, codon_aware=True, f=0.2,
         gapext: 缺口扩展概率 (如果为None，使用PRANK基于数据类型的默认值)
         use_logs: 对大型数据集使用对数计算
         penalize_terminal_gaps: 是否正常惩罚终端缺口
+        aligner_params: Dictionary containing aligner parameters including 'aligner_threads'
     """
     start_time = time.time()
+
+    if aligner_params is None:
+        aligner_params = {}
     
     # 确保prank_path存在且可执行
     if not os.path.exists(prank_path):
@@ -1641,10 +1676,9 @@ def run_prank(input_file, output_prefix, prank_path, codon_aware=True, f=0.2,
     cmd.append('-shortnames')  # 在第一个空格处截断名称以便更好地处理
     
     # 性能优化：添加线程参数
-    # 获取系统可用的CPU核心数
-    cpu_count = multiprocessing.cpu_count()
-    thread_count = max(1, min(cpu_count - 1, 4))  # 使用最多4个线程或系统最大值-1
-    cmd.append(f'-threads={thread_count}')
+    thread_count = aligner_params.get('aligner_threads', 1)
+    if thread_count > 0:
+        cmd.append(f'-threads={thread_count}')
     
     if use_logs:
         cmd.append('-uselogs')  # 对大型数据集使用对数计算
@@ -1868,21 +1902,24 @@ def run_aligner(input_file, output_file, aligner_params):
             gaprate=aligner_params['gaprate'],
             gapext=aligner_params['gapext'],
             use_logs=aligner_params['use_logs'],
-            penalize_terminal_gaps=aligner_params['penalize_terminal_gaps']
+            penalize_terminal_gaps=aligner_params['penalize_terminal_gaps'],
+            aligner_params=aligner_params
         )
     elif aligner_type == 'muscle':
         return run_muscle(
             input_file,
             output_file,
             aligner_params['muscle_path'],
-            codon_aware=aligner_params['codon_aware']
+            codon_aware=aligner_params['codon_aware'],
+            aligner_params=aligner_params
         )
     elif aligner_type == 'mafft':
         return run_mafft(
             input_file,
             output_file,
             aligner_params['mafft_path'],
-            codon_aware=aligner_params['codon_aware']
+            codon_aware=aligner_params['codon_aware'],
+            aligner_params=aligner_params
         )
     else:
         logger.error(f"未知的比对工具: {aligner_type}")
@@ -2270,6 +2307,7 @@ def process_cds_file_standard(file_path, output_dir, aligner_params, sequences=N
         aligner_params: 比对参数
         sequences: 可选的预过滤序列字典
     """
+    temp_input = None # Initialize to ensure it's defined in finally
     try:
         file_name = os.path.basename(file_path)
         gene_name = file_name.replace('.cds', '')
@@ -2304,9 +2342,9 @@ def process_cds_file_standard(file_path, output_dir, aligner_params, sequences=N
         logger.info(f"为 {file_name} 处理 {len(input_seqs)} 个序列")
         
         # 创建带处理序列的临时FASTA文件
-        temp_dir = os.path.join(output_dir, "temp")
-        os.makedirs(temp_dir, exist_ok=True)
-        temp_input = os.path.join(temp_dir, f"{gene_name}_processed.fasta")
+        temp_dir_path = os.path.join(output_dir, "temp") 
+        os.makedirs(temp_dir_path, exist_ok=True)
+        temp_input = os.path.join(temp_dir_path, f"{gene_name}_processed.fasta")
         
         # 序列已在解析阶段预处理，直接写入临时文件
         with open(temp_input, 'w') as f:
@@ -2318,6 +2356,7 @@ def process_cds_file_standard(file_path, output_dir, aligner_params, sequences=N
         success, output_path = run_aligner(temp_input, aligned_output, aligner_params)
         if not success:
             logger.error(f"比对 {file_name} 失败")
+            # temp_input will be cleaned in finally
             return None
         
         # 确保我们使用正确的输出文件路径
@@ -2367,6 +2406,13 @@ def process_cds_file_standard(file_path, output_dir, aligner_params, sequences=N
         logger.error(f"处理 {file_path} 时出错: {str(e)}")
         logger.error(traceback.format_exc())
         return None
+    finally:
+        if temp_input and os.path.exists(temp_input) and aligner_params.get('clean_temp', True):
+            try:
+                os.remove(temp_input)
+                logger.debug(f"Cleaned up temporary file: {temp_input}")
+            except OSError as e:
+                logger.warning(f"Error cleaning up temporary file {temp_input}: {e}")
 
 def advanced_fix_alignment_frame(alignment_file, output_file=None):
     """
@@ -3071,11 +3117,11 @@ def run_trimal(input_file, output_file, trimal_params):
             cmd.extend(['-st', str(trimal_params['conservation_threshold'])])
     
     # 性能优化：添加多线程支持参数（如果TrimAl版本支持）
-    cpu_count = multiprocessing.cpu_count()
-    thread_count = max(1, min(cpu_count - 1, 4))  # 使用最多4个线程或系统最大值-1
+    thread_count = trimal_params.get('aligner_threads', 1)
     
     # TrimAl某些版本支持-threads参数
-    cmd.extend(['-threads', str(thread_count)])
+    if thread_count > 0: 
+        cmd.extend(['-threads', str(thread_count)])
     
     logger.debug(f"TrimAl命令: {' '.join(cmd)}")
     
@@ -3337,6 +3383,8 @@ def main():
     parser.add_argument("--muscle_path", help="MUSCLE可执行文件的绝对路径")
     parser.add_argument("--mafft_path", help="MAFFT可执行文件的绝对路径")
     parser.add_argument("--threads", type=int, default=4, help="用于并行处理的线程数")
+    parser.add_argument("--aligner_threads", type=int, default=1, 
+                        help="Number of threads for each individual aligner job (MAFFT, MUSCLE, PRANK, TrimAl). Default: 1")
     
     # BLAST参数
     parser.add_argument("--use_blast", action="store_true", help="使用BLAST帮助修复非3倍数序列")
@@ -3471,6 +3519,7 @@ def main():
         'prank_path': args.prank_path,
         'muscle_path': args.muscle_path,
         'mafft_path': args.mafft_path,
+        'aligner_threads': args.aligner_threads, 
         'codon_aware': not args.no_codon_aware,
         'duplicate_strategy': args.duplicate_strategy,
         'clean_temp': args.clean_temp,
@@ -3495,6 +3544,7 @@ def main():
         trimal_params = {
             'use_trimal': args.use_trimal,
             'trimal_path': args.trimal_path,
+            'aligner_threads': args.aligner_threads,
             'automated': args.trimal_automated,
             'gap_threshold': args.gap_threshold,
             'consistency_threshold': args.consistency_threshold,
